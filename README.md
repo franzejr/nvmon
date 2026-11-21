@@ -17,8 +17,11 @@ the kernel logged an Xid error since boot.
 - **Temperature, fan, power, memory**: each with a level bar and a chart of
   the last five minutes. Temperature also shows its peak.
 - **Performance state** (P2 awake, P8 idle), GPU and encoder load.
-- **Keepalive**: whether the `rtx-keepalive.service` user unit is running and
-  for how long, with a button to start or stop it. Stopping asks first.
+- **Keepalive**: whether the
+  [`rtx-keepalive.service`](https://github.com/franzejr/rtx-keepalive) user
+  unit is running and for how long, with a button to start or stop it.
+  Stopping asks first. Without the unit installed, the card shows "Not
+  installed".
 - **Processes on the GPU.**
 
 It reads everything through `nvidia-smi`, `journalctl`, and `systemctl --user`,
@@ -86,7 +89,9 @@ the GPU, a media process).
 ### The keepalive
 
 The keepalive takes the transition away by never letting the card go idle. It
-is a systemd user service that runs a tiny NVENC encode, 320×240 at 5 frames a
+lives in its own repository,
+[rtx-keepalive](https://github.com/franzejr/rtx-keepalive), with install
+instructions. It is a systemd user service that runs a tiny NVENC encode, 320×240 at 5 frames a
 second, thrown away as it is produced. That is enough to hold the card at P2
 and Gen 3, with GPU and encoder load rounding to zero.
 
@@ -94,7 +99,7 @@ and Gen 3, with GPU and encoder load rounding to zero.
 
 ```ini
 [Unit]
-Description=Keep the RTX 3060 out of idle (P2 / PCIe Gen 3) with a minimal NVENC encode, for the Xid 79 test
+Description=Keep an NVIDIA GPU out of idle (P2 / full PCIe speed) with a minimal NVENC encode
 
 [Service]
 ExecStart=/usr/bin/ffmpeg -hide_banner -loglevel error -re -f lavfi -i testsrc=size=320x240:rate=5 -c:v h264_nvenc -f null -
