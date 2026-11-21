@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Nvmon
+Comment=Watch an NVIDIA GPU: temperature, fan, power, and PCIe link
+Comment[pt]=Acompanhe uma GPU NVIDIA: temperatura, ventoinha, consumo e link PCIe
+Comment[pt_BR]=Acompanhe uma GPU NVIDIA: temperatura, ventoinha, consumo e link PCIe
+Exec=nvmon
+Icon=nvmon
+Terminal=false
+Categories=Utility;System;Monitor;
+StartupWMClass=nvmon
