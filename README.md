@@ -94,7 +94,7 @@ and Gen 3, with GPU and encoder load rounding to zero.
 
 ```ini
 [Unit]
-Description=Mantem a RTX 3060 fora do repouso (P2 / PCIe Gen3) com um encode NVENC minimo - teste do Xid 79
+Description=Keep the RTX 3060 out of idle (P2 / PCIe Gen 3) with a minimal NVENC encode, for the Xid 79 test
 
 [Service]
 ExecStart=/usr/bin/ffmpeg -hide_banner -loglevel error -re -f lavfi -i testsrc=size=320x240:rate=5 -c:v h264_nvenc -f null -
