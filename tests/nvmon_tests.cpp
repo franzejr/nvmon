@@ -1,3 +1,4 @@
+#include <QDateTime>
 #include <QDir>
 #include <QFile>
 #include <QTemporaryDir>
@@ -69,6 +70,10 @@ private slots:
         QCOMPARE(code, 154);
         QCOMPARE(time, QString("2026-11-20 15:31:41"));
         QCOMPARE(Backend::countXids("-- No entries --\n"), 0);
+
+        qint64 epoch = 0;
+        Backend::countXids(journal, nullptr, nullptr, &epoch);
+        QCOMPARE(epoch, QDateTime::fromString("2026-11-20T15:31:41-03:00", Qt::ISODate).toMSecsSinceEpoch());
     }
 
     void readsTheKeepaliveState()
@@ -77,6 +82,54 @@ private slots:
         QCOMPARE(Backend::parseUnitState("LoadState=loaded\nActiveState=inactive\n"), QString("inactive"));
         QCOMPARE(Backend::parseUnitState("LoadState=not-found\nActiveState=inactive\n"), QString("missing"));
         QCOMPARE(Backend::parseUnitState(""), QString("missing"));
+    }
+
+    void readsWhenTheKeepaliveStarted()
+    {
+        QCOMPARE(Backend::parseUnitStartMonotonicUs(
+                     "LoadState=loaded\nActiveState=active\nActiveEnterTimestampMonotonic=845123456\n"),
+                 qint64(845123456));
+        QCOMPARE(Backend::parseUnitStartMonotonicUs("ActiveEnterTimestampMonotonic=0\n"), qint64(0));
+        QCOMPARE(Backend::parseUnitStartMonotonicUs(""), qint64(0));
+    }
+
+    void readsTheBootTimeFromUptime()
+    {
+        QTemporaryDir dir;
+        write(dir.filePath("uptime"), "49620.55 380000.10\n");
+        QCOMPARE(Backend::bootEpochMs(dir.filePath("uptime"), 100000000), qint64(100000000 - 49620550));
+        QCOMPARE(Backend::bootEpochMs(dir.filePath("missing"), 100000000), qint64(0));
+    }
+
+    void keepsABoundedHistory()
+    {
+        QTemporaryDir dir;
+        const QString smi = script(dir, "nvidia-smi",
+            "case \"$1\" in\n"
+            "  --query-gpu=*) echo 'Test GPU, 1.2.3, 50, 30, 20.50, 170.00, P2, 3, 3, 8, 16, 100, 12288, 2, 0' ;;\n"
+            "  *) true ;;\n"
+            "esac\n");
+        Backend::Tools tools;
+        tools.nvidiaSmi = smi;
+        Backend backend(tools, 5);
+        QTRY_VERIFY_WITH_TIMEOUT(backend.history().value("linkGen").toList().size() >= 3, 10000);
+        QCOMPARE(backend.history().value("linkGen").toList().first().toDouble(), 3.0);
+        QCOMPARE(backend.history().value("temperature").toList().first().toDouble(), 50.0);
+        QVERIFY(backend.history().value("linkGen").toList().size() <= Backend::HistorySize);
+    }
+
+    void stableSinceIsTheBootWithoutErrors()
+    {
+        QTemporaryDir dir;
+        write(dir.filePath("uptime"), "3600.00 1.00\n");
+        const QString journalctl = script(dir, "journalctl", "echo '-- No entries --'; exit 1\n");
+        Backend::Tools tools;
+        tools.journalctl = journalctl;
+        tools.uptimeFile = dir.filePath("uptime");
+        const qint64 before = QDateTime::currentMSecsSinceEpoch();
+        Backend backend(tools, 60000);
+        QTRY_VERIFY(backend.stableSince() > 0);
+        QVERIFY(qAbs(backend.stableSince() - (before - 3600000)) < 5000);
     }
 
     void reportsAMissingNvidiaSmi()
@@ -97,7 +150,11 @@ private slots:
         const QString systemctl = script(dir, "systemctl", "printf 'LoadState=loaded\\nActiveState=active\\n'\n");
         const QString journalctl = script(dir, "journalctl", "echo '-- No entries --'; exit 1\n");
 
-        Backend backend(Backend::Tools{smi, journalctl, systemctl}, 60000);
+        Backend::Tools tools;
+        tools.nvidiaSmi = smi;
+        tools.journalctl = journalctl;
+        tools.systemctl = systemctl;
+        Backend backend(tools, 60000);
         QTRY_COMPARE(backend.gpu().value("name").toString(), QString("Test GPU"));
         QTRY_COMPARE(backend.apps().size(), 1);
         QTRY_COMPARE(backend.keepalive(), QString("active"));
@@ -110,7 +167,9 @@ private slots:
         QTemporaryDir dir;
         const QString smi = script(dir, "nvidia-smi",
             "echo 'Unable to determine the device handle for GPU0: 0000:02:00.0: GPU is lost.'; exit 15\n");
-        Backend backend(Backend::Tools{smi, {}, {}}, 60000);
+        Backend::Tools tools;
+        tools.nvidiaSmi = smi;
+        Backend backend(tools, 60000);
         QTRY_VERIFY(backend.error().contains("GPU is lost"));
         QVERIFY(backend.gpu().isEmpty());
     }

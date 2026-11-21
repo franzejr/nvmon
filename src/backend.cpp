@@ -1,12 +1,17 @@
 #include "backend.h"
 
+#include <QDateTime>
+#include <QFile>
 #include <QProcess>
 #include <QRegularExpression>
 #include <QStandardPaths>
 
 Backend::Tools Backend::Tools::system() {
-    return {QStandardPaths::findExecutable("nvidia-smi"), QStandardPaths::findExecutable("journalctl"),
-            QStandardPaths::findExecutable("systemctl")};
+    Tools tools;
+    tools.nvidiaSmi = QStandardPaths::findExecutable("nvidia-smi");
+    tools.journalctl = QStandardPaths::findExecutable("journalctl");
+    tools.systemctl = QStandardPaths::findExecutable("systemctl");
+    return tools;
 }
 
 Backend::Backend(const Tools &tools, int intervalMs, QObject *parent) : QObject(parent), m_tools(tools) {
@@ -66,6 +71,10 @@ QStringList Backend::gpuQueryFields() {
             "memory.used", "memory.total", "utilization.gpu", "utilization.encoder"};
 }
 
+QStringList Backend::historyKeys() {
+    return {"linkGen", "temperature", "fan", "power", "memoryUsed"};
+}
+
 // One CSV line from nvidia-smi, in gpuQueryFields() order. A value the card
 // doesn't report ("[N/A]") is left out of the map, so QML shows a dash.
 QVariantMap Backend::parseGpu(const QString &csvLine) {
@@ -110,7 +119,7 @@ QVariantList Backend::parseApps(const QString &csv) {
 }
 
 // Kernel journal lines in short-iso format. Each NVRM Xid line is one error.
-int Backend::countXids(const QString &journal, int *lastCode, QString *lastTime) {
+int Backend::countXids(const QString &journal, int *lastCode, QString *lastTime, qint64 *lastEpochMs) {
     static const QRegularExpression expression(R"re(^(\S+) .*NVRM: Xid \([^)]*\): (\d+))re",
                                                QRegularExpression::MultilineOption);
     int count = 0;
@@ -118,15 +127,20 @@ int Backend::countXids(const QString &journal, int *lastCode, QString *lastTime)
     while (matches.hasNext()) {
         const auto match = matches.next();
         ++count;
+        const QString stamp = match.captured(1);
         if (lastCode)
             *lastCode = match.captured(2).toInt();
         if (lastTime)
-            *lastTime = match.captured(1).left(19).replace('T', ' ');
+            *lastTime = stamp.left(19).replace('T', ' ');
+        if (lastEpochMs) {
+            const QDateTime when = QDateTime::fromString(stamp, Qt::ISODate);
+            *lastEpochMs = when.isValid() ? when.toMSecsSinceEpoch() : 0;
+        }
     }
     return count;
 }
 
-// Output of "systemctl show -p LoadState -p ActiveState".
+// Output of "systemctl show -p LoadState -p ActiveState ...".
 QString Backend::parseUnitState(const QString &showOutput) {
     QString load, active;
     for (const QString &line : showOutput.split('\n', Qt::SkipEmptyParts)) {
@@ -138,6 +152,50 @@ QString Backend::parseUnitState(const QString &showOutput) {
     if (load != "loaded" || active.isEmpty())
         return "missing";
     return active;
+}
+
+// systemd's monotonic clock counts from boot, which sidesteps parsing its
+// localized wall-clock timestamps.
+qint64 Backend::parseUnitStartMonotonicUs(const QString &showOutput) {
+    static const QRegularExpression expression(R"re(^ActiveEnterTimestampMonotonic=(\d+)\s*$)re",
+                                               QRegularExpression::MultilineOption);
+    const auto match = expression.match(showOutput);
+    return match.hasMatch() ? match.captured(1).toLongLong() : 0;
+}
+
+// The first number in /proc/uptime is seconds since boot.
+qint64 Backend::bootEpochMs(const QString &uptimeFile, qint64 nowMs) {
+    QFile file(uptimeFile);
+    if (!file.open(QIODevice::ReadOnly))
+        return 0;
+    bool ok = false;
+    const double seconds = QString::fromUtf8(file.readAll()).section(' ', 0, 0).toDouble(&ok);
+    return ok && seconds > 0 ? nowMs - qint64(seconds * 1000) : 0;
+}
+
+QVariantMap Backend::history() const {
+    QVariantMap history;
+    for (auto it = m_history.cbegin(); it != m_history.cend(); ++it) {
+        QVariantList values;
+        values.reserve(it.value().size());
+        for (double value : it.value())
+            values.append(value);
+        history.insert(it.key(), values);
+    }
+    return history;
+}
+
+// A lost GPU records nothing, which leaves a visible gap rather than zeros
+// that would look like an idle card.
+void Backend::record(const QVariantMap &gpu) {
+    for (const QString &key : historyKeys()) {
+        if (!gpu.contains(key))
+            continue;
+        auto &series = m_history[key];
+        series.append(gpu.value(key).toDouble());
+        while (series.size() > HistorySize)
+            series.removeFirst();
+    }
 }
 
 void Backend::pollGpu() {
@@ -170,6 +228,7 @@ void Backend::pollGpu() {
             }
             m_error.clear();
             m_gpu = gpu;
+            record(gpu);
             run(m_tools.nvidiaSmi,
                 {"--query-compute-apps=pid,name,used_memory", "--format=csv,noheader,nounits", "--id=0"},
                 [this](bool ok, const QString &out, const QString &) {
@@ -185,39 +244,51 @@ void Backend::pollSystem() {
     if (m_systemBusy)
         return;
     m_systemBusy = true;
-    auto readService = [this] {
+    const qint64 boot = bootEpochMs(m_tools.uptimeFile, QDateTime::currentMSecsSinceEpoch());
+
+    auto readService = [this, boot] {
         if (m_tools.systemctl.isEmpty()) {
             m_systemBusy = false;
+            emit changed();
             return;
         }
-        run(m_tools.systemctl, {"--user", "show", "-p", "LoadState", "-p", "ActiveState", KeepaliveUnit},
-            [this](bool, const QString &out, const QString &) {
+        run(m_tools.systemctl,
+            {"--user", "show", "-p", "LoadState", "-p", "ActiveState", "-p", "ActiveEnterTimestampMonotonic",
+             KeepaliveUnit},
+            [this, boot](bool, const QString &out, const QString &) {
                 m_keepalive = parseUnitState(out);
+                const qint64 startUs = parseUnitStartMonotonicUs(out);
+                m_keepaliveSince = m_keepalive == "active" && boot > 0 && startUs > 0 ? boot + startUs / 1000 : 0;
                 m_systemBusy = false;
                 emit changed();
             });
     };
+
     if (m_tools.journalctl.isEmpty()) {
+        m_stableSince = boot;
         readService();
         return;
     }
     // journalctl exits 1 when nothing matches, which simply means no errors.
     run(m_tools.journalctl, {"-k", "-b", "0", "--no-pager", "-o", "short-iso", "-g", "NVRM: Xid"},
-        [this, readService](bool, const QString &out, const QString &) {
+        [this, readService, boot](bool, const QString &out, const QString &) {
             int code = 0;
             QString time;
-            m_xidCount = countXids(out, &code, &time);
+            qint64 lastEpoch = 0;
+            m_xidCount = countXids(out, &code, &time, &lastEpoch);
             m_lastXidCode = code;
             m_lastXidTime = time;
-            emit changed();
+            m_stableSince = m_xidCount > 0 ? lastEpoch : boot;
             readService();
         });
 }
 
-void Backend::toggleKeepalive() {
+void Backend::startKeepalive() { controlKeepalive("start"); }
+void Backend::stopKeepalive() { controlKeepalive("stop"); }
+
+void Backend::controlKeepalive(const QString &verb) {
     if (m_tools.systemctl.isEmpty() || m_keepalive == "missing")
         return;
-    const QString verb = m_keepalive == "active" || m_keepalive == "activating" ? "stop" : "start";
     run(m_tools.systemctl, {"--user", verb, KeepaliveUnit}, [this](bool, const QString &, const QString &) {
         m_systemBusy = false;
         pollSystem();
